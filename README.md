@@ -9,4 +9,10 @@
   pidns_init_sleep.c
   multi_pidns.c
 
+### the following file commes form http://lwn.net/Articles/532748/
+
+  ns_child_exec.c
+  simple_init.c
+  orphan.c
+  ns_run.c
 
