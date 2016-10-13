@@ -16,3 +16,9 @@
   * orphan.c
   * ns_run.c
 
+### the following file commes form http://lwn.net/Articles/532593/
+
+  * demo_userns.c
+  * userns_child_exec.c
+
+
