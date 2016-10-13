@@ -21,4 +21,7 @@
   * demo_userns.c
   * userns_child_exec.c
 
+### the following file commes form http://lwn.net/Articles/540087/
+
+  * userns_setns_test.c
 
