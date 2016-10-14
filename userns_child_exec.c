@@ -49,7 +49,12 @@ static void usage(char *name) {
 	fprintf(stderr, "	-M uid_map	 Speciffy UID map for user user namespace\n");
 	fprintf(stderr, "	-G gid_map	 Speciffy GID map for user user namespace\n");
 	fprintf(stderr, "			 If -M or -G is specified, -U is required\n");
+	fprintf(stderr, "	-z		 Map user's UID and GID to 0 in user namespace\n");
+	fprintf(stderr, "			(equivalent to: -M '0 <uid> 1' -G '0 <gid> 1')\n");
 	fprintf(stderr, "	-v		 Display verbose message\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "	If -z, -M, or -G is specified, -U is required.\n");
+	fprintf(stderr, "	It is not permitted to specify both -z and either -M or -G.\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "	Map string for -M and -G consist of records of the form:\n");
 	fprintf(stderr, "\n");
@@ -86,18 +91,57 @@ static void update_map(char *mapping, char *map_file) {
 
 	fd = open(map_file, O_RDWR);
 	if (fd == -1) {
-		fprintf(stderr, "open %s: %s\n", map_file, strerror(errno));
+		fprintf(stderr, "ERROR: open %s: %s\n", map_file, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
 	if (write(fd, mapping, map_len) != map_len) {
-		fprintf(stderr, "write %s: %s\n", map_file, strerror(errno));
+		fprintf(stderr, "ERROR: write %s: %s\n", map_file, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
 	close(fd);
 }
 
+/* Linux 3.19 made a change in the handling of setgroups(2) and the 'gid_map'
+ * file to address a security issue.
+ * 
+ * the issue allowd *unprivileged* users to employ user namespaces in order to drop 
+ * The upshort of the 3.19 changes is that in order to update the 
+ * 'gid_map' file. use of the setgroups() system call in this usernamespace
+ * must first be disable by writing `deny` to one of the /proc/PID/setgroups files for
+ * this namespaces.
+ * That is the purpose of the following function.
+ **/
+static void proc_setgroups_write(pid_t child_pid, char *str){
+	char setgroups_path[PATH_MAX];
+	int fd;
+
+	snprintf(setgroups_path, PATH_MAX, "/proc/%ld/setgroups", (long)child_pid);
+
+	fd = open(setgroups_path, O_RDWR);
+	if (fd == -1) {
+		/**
+		  * We maybe on a system that does not support /proc/PID/setgroups. 
+		  * In that case, the file won't exist and the system won't impose the
+		  * restrictions tht Linux 3.19 added. That's fine: we do not need to do
+		  * anything in order to permit `gid_map` to be updated.
+		  *
+		  * However, if the error from open() was something other than ENOENT
+		  * error that is expected for that case, let the user know.
+		  */
+		if (errno != ENOENT)
+			fprintf(stderr, "ERROR: open %s: %s\n", setgroups_path,
+				 strerror(errno));
+		return;
+	}
+
+	if (write(fd, str, strlen(str)) == -1) 
+		fprintf(stderr, "ERROR: open %s: %s\n", setgroups_path,
+			strerror(errno));
+
+	close(fd);
+}
 
 // Start function for cloned child
 static int childFunc(void *arg) {
@@ -125,14 +169,19 @@ static int childFunc(void *arg) {
 static char child_stack[STACK_SIZE];		// space for child's stack
 
 int main(int argc, char **argv) {
-	int flags, opt;
+	int flags, opt, map_zero;
 	pid_t	child_pid;
 	struct child_args	args;
 	char *uid_map, *gid_map;
 	char map_path[PATH_MAX];
+	const int MAP_BUF_SIZE = 100;
+	char map_buf[MAP_BUF_SIZE];
 
 	flags = 0;
 	verbose = 0;
+	map_zero = 0;
+	gid_map = NULL;
+	uid_map = NULL;
 
 	/* Parse command-line options
 	 the initial `+` character in the final getopt() argument
@@ -141,7 +190,7 @@ int main(int argc, char **argv) {
 	 programe itself has command-line options.
 	 We do not want getopt() to treat those as options to this program.
 	*/
-	while ((opt = getopt(argc, argv, "+imnpuUvM:G:")) != -1) {
+	while ((opt = getopt(argc, argv, "+imnpuUvM:G:z")) != -1) {
 		switch(opt) {
 		case 'i': flags |= CLONE_NEWIPC;	break;
 		case 'm': flags |= CLONE_NEWNS;		break;
@@ -149,6 +198,7 @@ int main(int argc, char **argv) {
 		case 'p': flags |= CLONE_NEWPID;	break;
 		case 'u': flags |= CLONE_NEWUTS;	break;
 		case 'v': verbose = 1;			break;
+		case 'z': map_zero = 1;			break;
 		case 'M': uid_map = optarg;		break;
 		case 'G': gid_map = optarg;		break;
 		case 'U': flags |= CLONE_NEWUSER;	break;
@@ -157,7 +207,8 @@ int main(int argc, char **argv) {
 	}
 
 	// -M or -g without -U is nosensical
-	if ((uid_map != NULL || gid_map != NULL) && !(flags & CLONE_NEWUSER))
+	if (((uid_map != NULL || gid_map != NULL || map_zero) && !(flags & CLONE_NEWUSER)) || 
+		(map_zero && (uid_map != NULL || gid_map != NULL)))
 		usage(argv[0]);
 
 	if (optind >= argc)
@@ -188,12 +239,21 @@ int main(int argc, char **argv) {
 		printf("%s: PID of child created by clone() is %ld\n", argv[0], (long) child_pid);
 
 	// Update the uid and gid maps in the child
-	if (uid_map != NULL) {
+	if (uid_map != NULL || map_zero) {
 		snprintf(map_path, PATH_MAX, "/proc/%ld/uid_map", (long) child_pid);
+		if (map_zero ){
+			snprintf(map_buf, MAP_BUF_SIZE, "0 %ld 1", (long) getuid());
+			uid_map = map_buf;
+		}
 		update_map(uid_map, map_path);
 	}
-	if (gid_map != NULL) {
+	if (gid_map != NULL || map_zero) {
+		proc_setgroups_write(child_pid, "deny");
 		snprintf(map_path, PATH_MAX, "/proc/%ld/gid_map", (long) child_pid);
+		if (map_zero ){
+			snprintf(map_buf, MAP_BUF_SIZE, "0 %ld 1", (long) getgid());
+			gid_map = map_buf;
+		}
 		update_map(gid_map, map_path);
 	}
 
